@@ -1,9 +1,10 @@
 import asyncio
 import base64
 import io
+import json
 import subprocess
 import time
-from pathlib import Path
+import uuid
 
 import cv2
 import httpx
@@ -12,9 +13,29 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 from model import get_default_model_name, load_model
 from PIL import Image
-from schemas import (BatchPredictRequest, BatchPredictResponse, Detection,
-                     HealthResponse, MetricsResponse, PredictRequest,
-                     PredictResponse)
+from schemas import (
+    BatchPredictRequest,
+    BatchPredictResponse,
+    Detection,
+    HealthResponse,
+    MetricsResponse,
+    PredictRequest,
+    PredictResponse,
+)
+
+
+def log_event(event: str, level: str = "INFO", **kwargs):
+    """Emite um evento estruturado em JSON para stdout."""
+    import time
+
+    record = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "level": level,
+        "event": event,
+        **kwargs,
+    }
+    print(json.dumps(record, ensure_ascii=False), flush=True)
+
 
 _streaming_lock = asyncio.Lock()
 
@@ -138,18 +159,52 @@ async def health_check():
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(request: PredictRequest):
+    request_id = str(uuid.uuid4())[:8]
     _metrics["total"] += 1
+
+    log_event(
+        "predict_start",
+        request_id=request_id,
+        model=request.model_name,
+        confidence=request.confidence,
+    )
+
+    if not request.image_base64 and not request.image_url:
+        log_event(
+            "predict_error", level="WARN", request_id=request_id, reason="missing_input"
+        )
+        raise HTTPException(
+            status_code=422, detail="Forneça image_base64 ou image_url."
+        )
     try:
-        img = _load_image_from_request(request)
+        if request.image_base64:
+            img = _decode_image(request.image_base64)
+        else:
+            import httpx
+
+            resp = httpx.get(request.image_url, timeout=10)
+            resp.raise_for_status()
+            img = _decode_image(base64.b64encode(resp.content).decode())
+
         result = _run_inference(img, request.model_name, request.confidence)
         _metrics["success"] += 1
         _metrics["total_ms"] += result.inference_ms
+
+        log_event(
+            "predict_complete",
+            request_id=request_id,
+            model=result.model_used,
+            detections=len(result.detections),
+            inference_ms=result.inference_ms,
+            image_size=f"{result.image_width}x{result.image_height}",
+        )
         return result
-    except HTTPException:
-        raise
+
     except FileNotFoundError as e:
+        log_event("predict_error", level="ERROR", request_id=request_id, reason=str(e))
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
+        log_event("predict_error", level="ERROR", request_id=request_id, reason=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -255,14 +310,18 @@ async def get_metrics():
         avg_inference_ms=round(avg, 2),
     )
 
+
 # ── Streaming de Vídeo (MJPEG) ──────────────────────────────
+
 
 @app.get("/stream/camera")
 async def stream_camera(
     request: Request,
     confidence: float = Query(0.25, ge=0.0, le=1.0, description="Limiar de confiança"),
     model_name: str = Query("yolov8n.pt", description="Modelo YOLO a ser utilizado"),
-    framerate: int = Query(15, ge=1, le=30, description="FPS de captura solicitados ao sensor"),
+    framerate: int = Query(
+        15, ge=1, le=30, description="FPS de captura solicitados ao sensor"
+    ),
 ):
     """Transmite vídeo contínuo da câmera com detecções YOLO sobrepostas em cada frame."""
     if _streaming_lock.locked():
@@ -276,14 +335,21 @@ async def stream_camera(
     async def frame_generator():
         cmd = [
             "rpicam-vid",
-            "-t", "0",
+            "-t",
+            "0",
             "-n",
-            "--codec", "mjpeg",
-            "--quality", "80",
-            "--width", "640",
-            "--height", "480",
-            "--framerate", str(framerate),
-            "-o", "-",
+            "--codec",
+            "mjpeg",
+            "--quality",
+            "80",
+            "--width",
+            "640",
+            "--height",
+            "480",
+            "--framerate",
+            str(framerate),
+            "-o",
+            "-",
         ]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         print(f"[stream/camera] rpicam-vid iniciado (pid={proc.pid})", flush=True)
@@ -301,8 +367,11 @@ async def stream_camera(
                             loop.run_in_executor(None, proc.stdout.read, 4096),
                             timeout=5.0,
                         )
-                    except asyncio.TimeoutError:
-                        print("[stream/camera] Nenhum frame em 5s — encerrando (câmera pode estar ocupada ou não detectada).", flush=True)
+                    except TimeoutError:
+                        print(
+                            "[stream/camera] Nenhum frame em 5s — encerrando (câmera pode estar ocupada ou não detectada).",
+                            flush=True,
+                        )
                         break
 
                     if not chunk:
@@ -315,8 +384,8 @@ async def stream_camera(
                         if start == -1 or end == -1:
                             break
 
-                        raw_frame = buffer[start:end + 2]
-                        buffer = buffer[end + 2:]
+                        raw_frame = buffer[start : end + 2]
+                        buffer = buffer[end + 2 :]
 
                         img = Image.open(io.BytesIO(raw_frame)).convert("RGB")
                         img_np = np.array(img)
@@ -343,12 +412,16 @@ async def stream_camera(
                 if proc.stderr:
                     stderr_output = proc.stderr.read().decode(errors="ignore").strip()
                     if stderr_output:
-                        print(f"[stream/camera] rpicam-vid stderr:\n{stderr_output}", flush=True)
+                        print(
+                            f"[stream/camera] rpicam-vid stderr:\n{stderr_output}",
+                            flush=True,
+                        )
 
     return StreamingResponse(
         frame_generator(),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
 
 @app.get("/stream/view", response_class=HTMLResponse)
 async def stream_view():
