@@ -5,6 +5,7 @@ Uso: python scripts/validate_model.py [--threshold 0.50]
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -38,8 +39,20 @@ def main():
 
     # Sem dataset explícito, usa o dataset interno do modelo pré-treinado
     if args.dataset:
-        print(f"[INFO] Validando com dataset: {args.dataset}")
-        metrics = model.val(data=args.dataset, split="val", verbose=False)
+        dataset_path = Path(args.dataset).resolve()
+        if not dataset_path.exists():
+            print(f"[ERRO] Dataset não encontrado: {dataset_path}")
+            sys.exit(1)
+
+        # Muda para o diretório do dataset para que caminhos relativos no YAML funcionem
+        original_dir = os.getcwd()
+        os.chdir(dataset_path.parent)
+
+        print(f"[INFO] Validando com dataset: {dataset_path}")
+        try:
+            metrics = model.val(data=dataset_path.name, split="val", verbose=False)
+        finally:
+            os.chdir(original_dir)
     else:
         # Validação rápida com COCO128 (dataset embutido no ultralytics)
         print("[INFO] Validando com COCO128 (dataset padrão)")
