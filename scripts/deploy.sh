@@ -27,7 +27,9 @@ docker compose pull
 python3 -m dvc pull models/yolo-epi.pt
 
 echo "[2/4] Iniciando nova versão..."
-docker compose up -d --build# ── Aguarda o serviço estabilizar ────────────────────────────
+docker compose up -d --build
+
+# ── Aguarda o serviço estabilizar ────────────────────────────
 
 echo "[3/4] Aguardando health check ($((HEALTH_RETRIES * HEALTH_WAIT))s max)..."
 SUCCESS=false
